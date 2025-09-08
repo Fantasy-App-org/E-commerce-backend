@@ -1,5 +1,6 @@
 import secrets
 import string
+import uuid
 
 from django.db import transaction
 from django.shortcuts import get_object_or_404
@@ -13,12 +14,13 @@ from rest_framework import status, permissions, viewsets, generics
 from django.utils.text import slugify
 from rest_framework.pagination import PageNumberPagination
 
-from .models import Category, Product, ProductImage, Cart, CartItem, Order, OrderItem, Review, Voucher
+from .models import Category, Product, ProductImage, Cart, CartItem, Order, OrderItem, Review, Voucher, PaymentTransaction, PlatformSettings
 from .serializers import (
     CategorySerializer, ProductListSerializer, ProductDetailSerializer,
     ProductSerializer, ProductCreateSerializer, ProductImageSerializer,
     ReviewSerializer, CartSerializer, AddToCartSerializer,
-    OrderSerializer, OrderItemSerializer, SellerProductSerializer, VoucherSerializer, VoucherPurchaseSerializer
+    OrderSerializer, OrderItemSerializer, SellerProductSerializer, VoucherSerializer, VoucherPurchaseSerializer,
+    PaymentTransactionSerializer, PaymentInitiateSerializer, PaymentCallbackSerializer
 )
 
 class StandardPagination(PageNumberPagination):
@@ -163,7 +165,7 @@ class OrderCreateView(APIView):
             if it.product.stock < it.qty:
                 return Response({"detail": f"Insufficient stock for {it.product.title}."}, status=400)
 
-        order = Order.objects.create(user=request.user, total=cart.total)
+        order = Order.objects.create(user=request.user)
         order_items = []
         for it in cart.items.select_related("product"):
             it.product.stock -= it.qty
@@ -173,6 +175,10 @@ class OrderCreateView(APIView):
                 title_snapshot=it.product.title, price_snapshot=it.price_snapshot, qty=it.qty
             ))
         OrderItem.objects.bulk_create(order_items)
+        
+        # Calculate totals including GST and commission
+        order.calculate_totals()
+        
         cart.items.all().delete()
         serializer = OrderSerializer(order)
         return Response(serializer.data, status=201)
@@ -291,3 +297,171 @@ class VoucherListView(generics.ListAPIView):
 
     def get_queryset(self):
         return Voucher.objects.filter(user=self.request.user).order_by('-created_at')
+
+
+# ------------------ Payment Gateway ------------------
+class PaymentInitiateView(APIView):
+    """Initiate payment for an order"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = PaymentInitiateSerializer(data=request.data)
+        if serializer.is_valid():
+            order_id = serializer.validated_data['order_id']
+            gateway = serializer.validated_data['payment_gateway']
+            
+            try:
+                order = Order.objects.get(id=order_id, user=request.user)
+            except Order.DoesNotExist:
+                return Response({"detail": "Order not found."}, status=404)
+            
+            if order.payment_status == 'completed':
+                return Response({"detail": "Order already paid."}, status=400)
+            
+            # Generate unique transaction ID
+            transaction_id = f"{gateway.upper()}_{uuid.uuid4().hex[:12]}"
+            
+            # Create payment transaction record
+            payment_transaction = PaymentTransaction.objects.create(
+                order=order,
+                transaction_id=transaction_id,
+                payment_gateway=gateway,
+                amount=order.total,
+                status='initiated'
+            )
+            
+            # Update order payment status
+            order.payment_status = 'processing'
+            order.payment_method = gateway
+            order.payment_transaction_id = transaction_id
+            order.save(update_fields=['payment_status', 'payment_method', 'payment_transaction_id'])
+            
+            # Here you would integrate with actual payment gateway
+            # For now, return the transaction details for frontend to handle
+            response_data = {
+                'transaction_id': transaction_id,
+                'order_id': order.id,
+                'amount': float(order.total),
+                'currency': 'INR',
+                'gateway': gateway,
+                'gateway_data': self._prepare_gateway_data(order, transaction_id, gateway)
+            }
+            
+            return Response(response_data, status=201)
+        return Response(serializer.errors, status=400)
+    
+    def _prepare_gateway_data(self, order, transaction_id, gateway):
+        """Prepare gateway-specific data"""
+        base_data = {
+            'order_id': order.id,
+            'amount': float(order.total),
+            'currency': 'INR',
+            'description': f'Order #{order.id}',
+            'customer': {
+                'name': order.user.name,
+                'email': order.user.email,
+                'phone': order.user.phone_number
+            }
+        }
+        
+        if gateway == 'razorpay':
+            return {
+                **base_data,
+                'key': 'YOUR_RAZORPAY_KEY_ID',  # Replace with actual key
+                'order_id': transaction_id,
+                'callback_url': '/api/payment/callback/razorpay/',
+                'prefill': base_data['customer']
+            }
+        elif gateway == 'payu':
+            return {
+                **base_data,
+                'key': 'YOUR_PAYU_MERCHANT_KEY',  # Replace with actual key
+                'txnid': transaction_id,
+                'surl': '/api/payment/callback/payu/success/',
+                'furl': '/api/payment/callback/payu/failure/',
+                'productinfo': base_data['description']
+            }
+        
+        return base_data
+
+
+class PaymentCallbackView(APIView):
+    """Handle payment gateway callbacks"""
+    permission_classes = [permissions.AllowAny]  # Gateway callbacks don't have user auth
+
+    def post(self, request, gateway):
+        """Handle payment callback from gateway"""
+        if gateway not in ['razorpay', 'payu', 'stripe', 'paypal']:
+            return Response({"detail": "Invalid gateway."}, status=400)
+        
+        # Extract transaction ID from request data
+        transaction_id = request.data.get('transaction_id') or request.data.get('txnid')
+        
+        if not transaction_id:
+            return Response({"detail": "Transaction ID missing."}, status=400)
+        
+        try:
+            payment_transaction = PaymentTransaction.objects.get(transaction_id=transaction_id)
+            order = payment_transaction.order
+        except PaymentTransaction.DoesNotExist:
+            return Response({"detail": "Transaction not found."}, status=404)
+        
+        # Process gateway-specific response
+        success = self._process_gateway_response(gateway, request.data, payment_transaction)
+        
+        if success:
+            payment_transaction.status = 'success'
+            order.payment_status = 'completed'
+            order.status = 'paid'
+        else:
+            payment_transaction.status = 'failed'
+            order.payment_status = 'failed'
+        
+        payment_transaction.gateway_response = request.data
+        payment_transaction.save()
+        order.save(update_fields=['payment_status', 'status'])
+        
+        return Response({
+            'status': 'success' if success else 'failed',
+            'order_id': order.id,
+            'transaction_id': transaction_id
+        })
+    
+    def _process_gateway_response(self, gateway, data, payment_transaction):
+        """Process gateway-specific response data"""
+        if gateway == 'razorpay':
+            # Verify Razorpay signature here
+            return data.get('status') == 'success'
+        elif gateway == 'payu':
+            # Verify PayU hash here
+            return data.get('status') == 'success'
+        elif gateway == 'stripe':
+            # Verify Stripe webhook signature here
+            return data.get('status') == 'succeeded'
+        
+        return False
+
+
+class PaymentStatusView(APIView):
+    """Check payment status for an order"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, order_id):
+        try:
+            order = Order.objects.get(id=order_id, user=request.user)
+            transactions = order.payment_transactions.all().order_by('-created_at')
+            
+            return Response({
+                'order_id': order.id,
+                'payment_status': order.payment_status,
+                'order_status': order.status,
+                'total_amount': order.total,
+                'transactions': PaymentTransactionSerializer(transactions, many=True).data
+            })
+        except Order.DoesNotExist:
+            return Response({"detail": "Order not found."}, status=404)
+
+
+def generate_voucher_code(length=10):
+    characters = string.ascii_uppercase + string.digits
+    return ''.join(secrets.choice(characters) for _ in range(length))

@@ -1,244 +1,293 @@
-from django.db import models
-from django.conf import settings
+import secrets
+import string
+
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from django.utils.crypto import get_random_string
+from rest_framework.generics import ListCreateAPIView
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status, permissions, viewsets, generics
 from django.utils.text import slugify
-from decimal import Decimal
-import json
+from rest_framework.pagination import PageNumberPagination
 
-# --- Core catalog models ---
+from .models import Category, Product, ProductImage, Cart, CartItem, Order, OrderItem, Review, Voucher
+from .serializers import (
+    CategorySerializer, ProductListSerializer, ProductDetailSerializer,
+    ProductSerializer, ProductCreateSerializer, ProductImageSerializer,
+    ReviewSerializer, CartSerializer, AddToCartSerializer,
+    OrderSerializer, OrderItemSerializer, SellerProductSerializer, VoucherSerializer, VoucherPurchaseSerializer
+)
 
-class Category(models.Model):
-    name = models.CharField(max_length=100, unique=True)
-    slug = models.SlugField(unique=True, blank=True)
-    gst_rate = models.DecimalField(
-        max_digits=5, 
-        decimal_places=2, 
-        default=18.00,
-        help_text="GST rate in percentage"
-    )
+class StandardPagination(PageNumberPagination):
+    page_size = 12
+    page_size_query_param = "page_size"
 
-    def save(self, *args, **kwargs):
-        if not self.slug:
-            self.slug = slugify(self.name)
-        super().save(*args, **kwargs)
+# ------------------ Category ------------------
+class CategoryListView(ListCreateAPIView):
+    queryset = Category.objects.all()
+    serializer_class = CategorySerializer
 
-    def __str__(self):
-        return self.name
+# ------------------ Product ------------------
+class ProductListView(APIView):
+    permission_classes = [permissions.AllowAny]
 
-    @property
-    def gst_rate_decimal(self):
-        """Return GST rate as decimal (18% = 0.18)"""
-        return self.gst_rate / 100
-class Product(models.Model):
-    seller = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="products")
-    category = models.ForeignKey(Category, on_delete=models.PROTECT, related_name="products")
-    title = models.CharField(max_length=200)
-    slug = models.SlugField(max_length=220, unique=True)
-    description = models.TextField(blank=True)
-    price = models.DecimalField(max_digits=10, decimal_places=2)
-    mrp = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    stock = models.PositiveIntegerField(default=0)
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    def get(self, request):
+        queryset = Product.objects.filter(is_active=True).select_related("category", "seller").prefetch_related("images")
+        category_slug = request.query_params.get("category__slug")
+        search = request.query_params.get("search")
+        ordering = request.query_params.get("ordering", "-created_at")
 
-    # optional simple attributes
-    brand = models.CharField(max_length=120, blank=True)
-    sku = models.CharField(max_length=100, blank=True)
+        if category_slug:
+            queryset = queryset.filter(category__slug=category_slug)
+        if search:
+            queryset = queryset.filter(title__icontains=search)
 
-    def __str__(self):
-        return self.title
+        queryset = queryset.order_by(ordering)
+        paginator = StandardPagination()
+        page = paginator.paginate_queryset(queryset, request)
+        serializer = ProductListSerializer(page, many=True, context={"request": request})
+        return paginator.get_paginated_response(serializer.data)
 
-    @property
-    def price_with_gst(self):
-        """Calculate price including GST"""
-        gst_amount = self.price * self.category.gst_rate_decimal
-        return self.price + gst_amount
+class ProductDetailView(APIView):
+    permission_classes = [permissions.AllowAny]
 
-    @property
-    def gst_amount(self):
-        """Calculate GST amount for this product"""
-        return self.price * self.category.gst_rate_decimal
-    class Meta:
-        ordering = ['-created_at']
+    def get(self, request, slug):
+        product = get_object_or_404(Product.objects.prefetch_related("images"), slug=slug, is_active=True)
+        serializer = ProductDetailSerializer(product, context={"request": request})
+        return Response(serializer.data)
 
-class ProductImage(models.Model):
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="images")
-    image = models.ImageField(upload_to="products/")
-    alt = models.CharField(max_length=200, blank=True)
+# ------------------ Reviews ------------------
+class ProductReviewView(APIView):
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
 
+    def get(self, request, slug):
+        product = get_object_or_404(Product, slug=slug, is_active=True)
+        reviews = product.reviews.select_related("user")
+        serializer = ReviewSerializer(reviews, many=True)
+        return Response(serializer.data)
 
-class Review(models.Model):
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="reviews")
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="reviews")
-    rating = models.PositiveSmallIntegerField()  # 1..5
-    comment = models.TextField(blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    def post(self, request, slug):
+        product = get_object_or_404(Product, slug=slug, is_active=True)
+        serializer = ReviewSerializer(data=request.data, context={"request": request})
+        if serializer.is_valid():
+            serializer.save(product=product)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    class Meta:
-        unique_together = ("product", "user")
+# ------------------ Cart ------------------
+class CartView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
 
+    def get_cart(self, user):
+        cart, _ = Cart.objects.get_or_create(user=user)
+        return cart
 
-# --- Cart / Order ---
+    def get(self, request):
+        cart = self.get_cart(request.user)
+        serializer = CartSerializer(cart, context={"request": request})
+        return Response(serializer.data)
 
-class Cart(models.Model):
-    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="cart")
-    updated_at = models.DateTimeField(auto_now=True)
+class CartAddView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
 
-    def __str__(self):
-        return f"Cart({self.user})"
+    def post(self, request):
+        serializer = AddToCartSerializer(data=request.data)
+        if serializer.is_valid():
+            product = serializer.validated_data["product"]
+            qty = serializer.validated_data["qty"]
+            cart, _ = Cart.objects.get_or_create(user=request.user)
+            item, created = CartItem.objects.get_or_create(
+                cart=cart, product=product,
+                defaults={"qty": qty, "price_snapshot": product.price}
+            )
+            if not created:
+                item.qty += qty
+                item.save()
+            cart_serializer = CartSerializer(cart, context={"request": request})
+            return Response(cart_serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    @property
-    def total(self):
-        return sum(item.subtotal for item in self.items.all())
+class CartUpdateItemView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
 
-
-class CartItem(models.Model):
-    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="items")
-    product = models.ForeignKey(Product, on_delete=models.PROTECT)
-    qty = models.PositiveIntegerField(default=1)
-    price_snapshot = models.DecimalField(max_digits=10, decimal_places=2)  # snapshot current price
-
-    class Meta:
-        unique_together = ("cart", "product")
-
-    @property
-    def subtotal(self):
-        return self.qty * self.price_snapshot
-
-    @property
-    def gst_amount(self):
-        """Calculate GST amount for this cart item"""
-        gst_rate = self.product.category.gst_rate / 100
-        return self.subtotal * gst_rate
-
-    @property
-    def total_with_gst(self):
-        """Calculate total including GST"""
-        return self.subtotal + self.gst_amount
-
-
-class Order(models.Model):
-    STATUS = (
-        ("created", "Created"),
-        ("paid", "Paid"),
-        ("shipped", "Shipped"),
-        ("delivered", "Delivered"),
-        ("cancelled", "Cancelled"),
-    )
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="orders")
-    status = models.CharField(max_length=20, choices=STATUS, default="created")
-    subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    gst_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    commission_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    total = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    
-    # Payment fields
-    PAYMENT_STATUS = (
-        ("pending", "Pending"),
-        ("processing", "Processing"),
-        ("completed", "Completed"),
-        ("failed", "Failed"),
-        ("refunded", "Refunded"),
-    )
-    payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS, default="pending")
-    payment_method = models.CharField(max_length=50, null=True, blank=True)
-    payment_transaction_id = models.CharField(max_length=100, null=True, blank=True)
-    
-    created_at = models.DateTimeField(auto_now_add=True)
-    shipped_at = models.DateTimeField(null=True, blank=True)
-
-    def calculate_totals(self):
-        """Calculate subtotal, GST, commission and total"""
-        self.subtotal = sum(item.subtotal for item in self.items.all())
-        self.gst_amount = sum(item.gst_amount for item in self.items.all())
-        
-        # Calculate platform commission
+    def patch(self, request):
+        item_id = request.data.get("item_id")
+        qty = int(request.data.get("qty", 1))
         try:
-            settings = PlatformSettings.objects.first()
-            commission_rate = settings.commission_rate / 100 if settings else Decimal('0.05')
-        except:
-            commission_rate = Decimal('0.05')  # Default 5%
-        
-        self.commission_amount = self.subtotal * commission_rate
-        self.total = self.subtotal + self.gst_amount
-        self.save(update_fields=['subtotal', 'gst_amount', 'commission_amount', 'total'])
+            item = CartItem.objects.get(pk=item_id, cart__user=request.user)
+        except CartItem.DoesNotExist:
+            return Response({"detail": "Item not found."}, status=404)
 
-    def __str__(self):
-        return f"Order#{self.pk} - {self.user}"
+        if qty <= 0:
+            item.delete()
+        else:
+            if item.product.stock < qty:
+                return Response({"detail": "Insufficient stock."}, status=400)
+            item.qty = qty
+            item.save()
+
+        cart = Cart.objects.get(user=request.user)
+        serializer = CartSerializer(cart, context={"request": request})
+        return Response(serializer.data)
+
+class CartClearView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def delete(self, request):
+        cart, _ = Cart.objects.get_or_create(user=request.user)
+        cart.items.all().delete()
+        return Response({"detail": "Cart cleared."})
+
+# ------------------ Orders ------------------
+class OrderListView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        orders = Order.objects.filter(user=request.user).prefetch_related("items")
+        serializer = OrderSerializer(orders, many=True)
+        return Response(serializer.data)
+
+class OrderCreateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request):
+        cart, _ = Cart.objects.get_or_create(user=request.user)
+        if cart.items.count() == 0:
+            return Response({"detail": "Cart is empty."}, status=400)
+
+        for it in cart.items.select_related("product"):
+            if it.product.stock < it.qty:
+                return Response({"detail": f"Insufficient stock for {it.product.title}."}, status=400)
+
+        order = Order.objects.create(user=request.user, total=cart.total)
+        order_items = []
+        for it in cart.items.select_related("product"):
+            it.product.stock -= it.qty
+            it.product.save(update_fields=["stock"])
+            order_items.append(OrderItem(
+                order=order, product=it.product,
+                title_snapshot=it.product.title, price_snapshot=it.price_snapshot, qty=it.qty
+            ))
+        OrderItem.objects.bulk_create(order_items)
+        cart.items.all().delete()
+        serializer = OrderSerializer(order)
+        return Response(serializer.data, status=201)
+
+# ------------------ Seller Management ------------------
+class IsSeller(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and hasattr(request.user, 'seller_profile') and request.user.seller_profile.status == 'approved'
+
+class SellerProductViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsSeller]
+
+    def get_queryset(self):
+        return Product.objects.filter(seller=self.request.user).prefetch_related('images', 'category')
+
+    def get_serializer_class(self):
+        if self.action in ['create', 'update', 'partial_update']:
+            return ProductCreateSerializer
+        return ProductSerializer
+
+    def perform_create(self, serializer):
+        title = serializer.validated_data['title']
+        slug = slugify(title)
+        sku = f"SKU-{get_random_string(8).upper()}"
+        serializer.save(seller=self.request.user, slug=slug, sku=sku)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        product = serializer.instance
+        # ✅ Return full product details after creation
+        return Response(
+            ProductSerializer(product, context={'request': request}).data,
+            status=status.HTTP_201_CREATED
+        )
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        product = serializer.instance
+        # ✅ Return full product details after update
+        return Response(
+            ProductSerializer(product, context={'request': request}).data,
+            status=status.HTTP_200_OK
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        instance.is_active = False
+        instance.save(update_fields=['is_active'])
+        return Response({"detail": "Product deactivated instead of deleting."}, status=status.HTTP_200_OK)
 
 
-class OrderItem(models.Model):
-    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="items")
-    product = models.ForeignKey(Product, on_delete=models.PROTECT)
-    title_snapshot = models.CharField(max_length=200)
-    price_snapshot = models.DecimalField(max_digits=10, decimal_places=2)
-    qty = models.PositiveIntegerField()
+class ProductImageUploadView(APIView):
+    permission_classes = [IsSeller]
 
-    @property
-    def subtotal(self):
-        return self.qty * self.price_snapshot
+    def post(self, request, *args, **kwargs):
+        product_id = request.data.get('product')
+        product = Product.objects.get(id=product_id, seller=request.user)
 
-    @property
-    def gst_amount(self):
-        """Calculate GST amount for this order item"""
-        gst_rate = self.product.category.gst_rate / 100
-        return self.subtotal * gst_rate
+        files = request.FILES.getlist('images')  # ✅ Multiple images
+        if not files:
+            return Response({"detail": "No images uploaded"}, status=400)
 
+        images = []
+        for file in files:
+            img = ProductImage.objects.create(product=product, image=file)
+            images.append(ProductImageSerializer(img).data)
 
-class PlatformSettings(models.Model):
-    """Platform configuration settings"""
-    commission_rate = models.DecimalField(
-        max_digits=5, 
-        decimal_places=2, 
-        default=5.00,
-        help_text="Platform commission rate in percentage"
-    )
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        verbose_name = "Platform Settings"
-        verbose_name_plural = "Platform Settings"
-
-    def __str__(self):
-        return f"Commission Rate: {self.commission_rate}%"
+        return Response(images, status=201)
 
 
-class PaymentTransaction(models.Model):
-    """Payment transaction records"""
-    GATEWAY_CHOICES = (
-        ('razorpay', 'Razorpay'),
-        ('payu', 'PayU'),
-        ('stripe', 'Stripe'),
-        ('paypal', 'PayPal'),
-    )
-    
-    STATUS_CHOICES = (
-        ('initiated', 'Initiated'),
-        ('processing', 'Processing'),
-        ('success', 'Success'),
-        ('failed', 'Failed'),
-        ('cancelled', 'Cancelled'),
-    )
-    
-    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='payment_transactions')
-    transaction_id = models.CharField(max_length=100, unique=True)
-    payment_gateway = models.CharField(max_length=20, choices=GATEWAY_CHOICES)
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
-    currency = models.CharField(max_length=3, default='INR')
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='initiated')
-    gateway_response = models.JSONField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+class SellerOrderView(generics.ListAPIView):
+    serializer_class = OrderItemSerializer
+    permission_classes = [IsSeller]
 
-    def __str__(self):
-        return f"Transaction {self.transaction_id} - {self.status}"
+    def get_queryset(self):
+        return OrderItem.objects.filter(product__seller=self.request.user).select_related('order', 'product')
 
-class Voucher(models.Model):
-    code = models.CharField(max_length=20, unique=True)
-    value = models.DecimalField(max_digits=10, decimal_places=2)
-    is_used = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
-    used_at = models.DateTimeField(null=True, blank=True)
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
 
-    def __str__(self):
-        return f"Voucher {self.code} ({self.value})"
+def generate_voucher_code(length=10):
+    characters = string.ascii_uppercase + string.digits
+    return ''.join(secrets.choice(characters) for _ in range(length))
+
+
+class VoucherPurchaseView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = VoucherPurchaseSerializer(data=request.data)
+        if serializer.is_valid():
+            value = serializer.validated_data['value']
+
+            # Generate a unique voucher code
+            while True:
+                code = generate_voucher_code()
+                if not Voucher.objects.filter(code=code).exists():
+                    break
+
+            voucher = Voucher.objects.create(
+                code=code,
+                value=value,
+                user=request.user
+            )
+            return Response(VoucherSerializer(voucher).data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class VoucherListView(generics.ListAPIView):
+    serializer_class = VoucherSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return Voucher.objects.filter(user=self.request.user).order_by('-created_at')

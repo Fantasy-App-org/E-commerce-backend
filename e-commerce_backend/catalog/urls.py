@@ -4,7 +4,8 @@ from .views import (
     CategoryListView, ProductListView, ProductDetailView, ProductReviewView,
     CartView, CartAddView, CartUpdateItemView, CartClearView,
     OrderListView, OrderCreateView,
-    SellerProductViewSet, ProductImageUploadView, SellerOrderView, VoucherPurchaseView, VoucherListView
+    SellerProductViewSet, ProductImageUploadView, SellerOrderView, VoucherPurchaseView, VoucherListView,
+    PaymentInitiateView, PaymentCallbackView, PaymentStatusView
 )
 
 router = DefaultRouter()
@@ -31,4 +32,9 @@ urlpatterns = [
 
     path('vouchers/purchase/', VoucherPurchaseView.as_view(), name='voucher-purchase'),
     path('vouchers/', VoucherListView.as_view(), name='voucher-list'),
+
+    # Payment Gateway
+    path('payment/initiate/', PaymentInitiateView.as_view(), name='payment-initiate'),
+    path('payment/callback/<str:gateway>/', PaymentCallbackView.as_view(), name='payment-callback'),
+    path('payment/status/<int:order_id>/', PaymentStatusView.as_view(), name='payment-status'),
 ]

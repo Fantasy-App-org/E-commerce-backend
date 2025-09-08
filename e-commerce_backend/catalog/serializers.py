@@ -32,6 +32,8 @@ class ProductListSerializer(serializers.ModelSerializer):
     thumbnail = serializers.SerializerMethodField()
     price_with_gst = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    price_with_gst = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
     class Meta:
         model = Product
@@ -44,6 +46,8 @@ class ProductListSerializer(serializers.ModelSerializer):
 class ProductDetailSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
     images = ProductImageSerializer(many=True, read_only=True)
+    price_with_gst = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     price_with_gst = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
@@ -110,6 +114,8 @@ class CartItemSerializer(serializers.ModelSerializer):
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     total_with_gst = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    total_with_gst = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
     class Meta:
         model = CartItem
@@ -125,10 +131,18 @@ class CartSerializer(serializers.ModelSerializer):
     total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     total_gst = serializers.SerializerMethodField()
     grand_total = serializers.SerializerMethodField()
+    total_gst = serializers.SerializerMethodField()
+    grand_total = serializers.SerializerMethodField()
 
     class Meta:
         model = Cart
         fields = ["id", "items", "total", "total_gst", "grand_total", "updated_at"]
+
+    def get_total_gst(self, obj):
+        return sum(item.gst_amount for item in obj.items.all())
+
+    def get_grand_total(self, obj):
+        return sum(item.total_with_gst for item in obj.items.all())
 
     def get_total_gst(self, obj):
         return sum(item.gst_amount for item in obj.items.all())
@@ -155,6 +169,7 @@ class AddToCartSerializer(serializers.Serializer):
 class OrderItemSerializer(serializers.ModelSerializer):
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
     class Meta:
         model = OrderItem
@@ -168,6 +183,21 @@ class OrderSerializer(serializers.ModelSerializer):
         fields = ["id", "status", "payment_status", "subtotal", "gst_amount", "total", "items", "created_at", "shipped_at"]
 
 
+# ------------------ Payment ------------------
+class PaymentTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaymentTransaction
+        fields = ['id', 'transaction_id', 'payment_gateway', 'amount', 'currency', 'status', 'created_at']
+        read_only_fields = ['transaction_id', 'created_at']
+
+class PaymentInitiateSerializer(serializers.Serializer):
+    order_id = serializers.IntegerField()
+    payment_gateway = serializers.ChoiceField(choices=PaymentTransaction.GATEWAY_CHOICES)
+    
+class PaymentCallbackSerializer(serializers.Serializer):
+    transaction_id = serializers.CharField()
+    status = serializers.ChoiceField(choices=['success', 'failed', 'cancelled'])
+    gateway_response = serializers.JSONField(required=False)
 # ------------------ Payment ------------------
 class PaymentTransactionSerializer(serializers.ModelSerializer):
     class Meta:
