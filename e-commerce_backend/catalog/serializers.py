@@ -2,7 +2,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from accounts.models import SellerProfile
-from .models import Category, Product, ProductImage, Review, Cart, CartItem, Order, OrderItem, Voucher
+from .models import Category, Product, ProductImage, Review, Cart, CartItem, Order, OrderItem, Voucher, PaymentTransaction
 
 
 # ------------------ Category ------------------
@@ -10,7 +10,7 @@ from .models import Category, Product, ProductImage, Review, Cart, CartItem, Ord
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
-        fields = ['id', 'name', 'slug']
+        fields = ['id', 'name', 'slug', 'gst_rate']
         read_only_fields = ['slug']  # slug will be auto-generated
 # ------------------ Product ------------------
 class ProductImageSerializer(serializers.ModelSerializer):
@@ -30,10 +30,12 @@ class ProductImageSerializer(serializers.ModelSerializer):
 class ProductListSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
     thumbnail = serializers.SerializerMethodField()
+    price_with_gst = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
     class Meta:
         model = Product
-        fields = ["id", "title", "slug", "price", "mrp", "brand", "stock", "category", "thumbnail"]
+        fields = ["id", "title", "slug", "price", "mrp", "price_with_gst", "gst_amount", "brand", "stock", "category", "thumbnail"]
 
     def get_thumbnail(self, obj):
         img = obj.images.first()
@@ -42,10 +44,12 @@ class ProductListSerializer(serializers.ModelSerializer):
 class ProductDetailSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
     images = ProductImageSerializer(many=True, read_only=True)
+    price_with_gst = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
     class Meta:
         model = Product
-        fields = ["id", "title", "slug", "description", "price", "mrp", "brand", "sku", "stock",
+        fields = ["id", "title", "slug", "description", "price", "mrp", "price_with_gst", "gst_amount", "brand", "sku", "stock",
                   "category", "images", "is_active", "created_at"]
 
 # ✅ Missing ProductSerializer (Generic)
@@ -104,10 +108,12 @@ class CartItemSerializer(serializers.ModelSerializer):
     product_title = serializers.CharField(source="product.title", read_only=True)
     image = serializers.SerializerMethodField()
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    total_with_gst = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
     class Meta:
         model = CartItem
-        fields = ["id", "product", "product_title", "qty", "price_snapshot", "subtotal", "image"]
+        fields = ["id", "product", "product_title", "qty", "price_snapshot", "subtotal", "gst_amount", "total_with_gst", "image"]
 
     def get_image(self, obj):
         img = obj.product.images.first()
@@ -117,10 +123,18 @@ class CartItemSerializer(serializers.ModelSerializer):
 class CartSerializer(serializers.ModelSerializer):
     items = CartItemSerializer(many=True, read_only=True)
     total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    total_gst = serializers.SerializerMethodField()
+    grand_total = serializers.SerializerMethodField()
 
     class Meta:
         model = Cart
-        fields = ["id", "items", "total", "updated_at"]
+        fields = ["id", "items", "total", "total_gst", "grand_total", "updated_at"]
+
+    def get_total_gst(self, obj):
+        return sum(item.gst_amount for item in obj.items.all())
+
+    def get_grand_total(self, obj):
+        return sum(item.total_with_gst for item in obj.items.all())
 
 class AddToCartSerializer(serializers.Serializer):
     product_id = serializers.IntegerField()
@@ -140,19 +154,35 @@ class AddToCartSerializer(serializers.Serializer):
 # ------------------ Orders ------------------
 class OrderItemSerializer(serializers.ModelSerializer):
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    gst_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
     class Meta:
         model = OrderItem
-        fields = ["id", "product", "title_snapshot", "price_snapshot", "qty", "subtotal"]
+        fields = ["id", "product", "title_snapshot", "price_snapshot", "qty", "subtotal", "gst_amount"]
 
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
-        fields = ["id", "status", "total", "items", "created_at", "shipped_at"]
+        fields = ["id", "status", "payment_status", "subtotal", "gst_amount", "total", "items", "created_at", "shipped_at"]
 
 
+# ------------------ Payment ------------------
+class PaymentTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaymentTransaction
+        fields = ['id', 'transaction_id', 'payment_gateway', 'amount', 'currency', 'status', 'created_at']
+        read_only_fields = ['transaction_id', 'created_at']
+
+class PaymentInitiateSerializer(serializers.Serializer):
+    order_id = serializers.IntegerField()
+    payment_gateway = serializers.ChoiceField(choices=PaymentTransaction.GATEWAY_CHOICES)
+    
+class PaymentCallbackSerializer(serializers.Serializer):
+    transaction_id = serializers.CharField()
+    status = serializers.ChoiceField(choices=['success', 'failed', 'cancelled'])
+    gateway_response = serializers.JSONField(required=False)
 
 class VoucherSerializer(serializers.ModelSerializer):
     class Meta:
